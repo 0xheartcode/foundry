@@ -14,7 +14,8 @@ use yansi::Paint;
 #[derive(Clone, Debug, Parser)]
 pub struct UpdateArgs {
     /// The dependencies you want to update.
-    dependencies: Vec<Dependency>,
+    #[arg(value_parser = |s: &str| Ok::<String, std::convert::Infallible>(s.to_string()))]
+    dependencies: Vec<String>,
 
     /// The project's root path.
     ///
@@ -30,14 +31,35 @@ pub struct UpdateArgs {
     /// Recursively update submodules.
     #[arg(short, long)]
     recursive: bool,
+
+    /// Use SSH URLs instead of HTTPS for git operations.
+    #[arg(long)]
+    ssh: bool,
 }
 impl_figment_convert_basic!(UpdateArgs);
 
 impl UpdateArgs {
     pub fn run(self) -> Result<()> {
         let config = self.load_config()?;
+        
+        // Extract needed fields before consuming self
+        let use_ssh = self.ssh;
+        let force = self.force;
+        let recursive = self.recursive;
+        
+        // Parse dependencies with SSH preference if --ssh flag is used
+        let dependencies: Vec<Dependency> = self.dependencies.into_iter()
+            .map(|dep_str| {
+                if use_ssh {
+                    Dependency::from_str_with_ssh_preference(&dep_str, true)
+                } else {
+                    dep_str.parse()
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        
         // dep_overrides consists of absolute paths of dependencies and their tags
-        let (root, _paths, dep_overrides) = dependencies_paths(&self.dependencies, &config)?;
+        let (root, _paths, dep_overrides) = dependencies_paths(&dependencies, &config)?;
         // Mapping of relative path of lib to its tag type
         // e.g "lib/forge-std" -> DepIdentifier::Tag { name: "v0.1.0", rev: "1234567" }
         let git = Git::new(&root);
@@ -75,17 +97,26 @@ impl UpdateArgs {
 
         // fetch the latest changes for each submodule (recursively if flag is set)
         let git = Git::new(&root);
-        let update_paths = self.update_dep_paths(&foundry_lock);
+        let update_paths = foundry_lock
+            .iter()
+            .filter_map(|(path, dep_id)| {
+                if dep_id.overridden() {
+                    Some(path.to_path_buf())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         trace!(?update_paths, "updating deps at");
 
-        if self.recursive {
+        if recursive {
             // update submodules recursively
-            git.submodule_update(self.force, true, false, true, update_paths)?;
+            git.submodule_update(force, true, false, true, update_paths)?;
         } else {
             let is_empty = update_paths.is_empty();
 
             // update submodules
-            git.submodule_update(self.force, true, false, false, update_paths)?;
+            git.submodule_update(force, true, false, false, update_paths)?;
 
             if !is_empty {
                 // initialize submodules of each submodule recursively (otherwise direct submodule
@@ -165,18 +196,6 @@ impl UpdateArgs {
         Ok(())
     }
 
-    /// Returns the `lib/paths` of the dependencies that have been updated/overridden.
-    fn update_dep_paths(&self, foundry_lock: &Lockfile<'_>) -> Vec<PathBuf> {
-        foundry_lock
-            .iter()
-            .filter_map(|(path, dep_id)| {
-                if dep_id.overridden() {
-                    return Some(path.to_path_buf());
-                }
-                None
-            })
-            .collect()
-    }
 }
 
 /// Returns `(root, paths, overridden_deps_with_abosolute_paths)` where `root` is the root of the

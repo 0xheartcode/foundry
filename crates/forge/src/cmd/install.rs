@@ -43,7 +43,8 @@ pub struct InstallArgs {
     ///
     /// Target installation directory can be added via `<alias>=` suffix.
     /// The dependency will installed to `lib/<alias>`.
-    dependencies: Vec<Dependency>,
+    #[arg(value_parser = |s: &str| Ok::<String, std::convert::Infallible>(s.to_string()))]
+    dependencies: Vec<String>,
 
     /// The project's root path.
     ///
@@ -61,7 +62,19 @@ impl_figment_convert_basic!(InstallArgs);
 impl InstallArgs {
     pub fn run(self) -> Result<()> {
         let mut config = self.load_config()?;
-        self.opts.install(&mut config, self.dependencies)
+        
+        // Parse dependencies with SSH preference if --ssh flag is used
+        let dependencies: Vec<Dependency> = self.dependencies.into_iter()
+            .map(|dep_str| {
+                if self.opts.ssh {
+                    Dependency::from_str_with_ssh_preference(&dep_str, true)
+                } else {
+                    dep_str.parse()
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+            
+        self.opts.install(&mut config, dependencies)
     }
 }
 
@@ -80,6 +93,10 @@ pub struct DependencyInstallOpts {
     /// Create a commit after installing the dependencies.
     #[arg(long)]
     pub commit: bool,
+
+    /// Use SSH URLs instead of HTTPS for git operations.
+    #[arg(long)]
+    pub ssh: bool,
 }
 
 impl DependencyInstallOpts {

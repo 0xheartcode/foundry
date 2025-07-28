@@ -1,7 +1,7 @@
 use super::install::DependencyInstallOpts;
 use clap::{Parser, ValueHint};
 use eyre::Result;
-use foundry_cli::utils::Git;
+use foundry_cli::{opts::Dependency, utils::Git};
 use foundry_common::fs;
 use foundry_compilers::artifacts::remappings::Remapping;
 use foundry_config::Config;
@@ -44,7 +44,10 @@ pub struct InitArgs {
 impl InitArgs {
     pub fn run(self) -> Result<()> {
         let Self { root, template, branch, install, offline, force, vscode } = self;
-        let DependencyInstallOpts { shallow, no_git, commit } = install;
+        let DependencyInstallOpts { shallow, no_git, commit, ssh } = install;
+        
+        // Reconstruct install options for later use
+        let install_opts = DependencyInstallOpts { shallow, no_git, commit, ssh };
 
         // create the root dir if it does not exist
         if !root.exists() {
@@ -137,7 +140,7 @@ impl InitArgs {
             if !dest.exists() {
                 fs::write(dest, config.clone().into_basic().to_string_pretty()?)?;
             }
-            let git = self.install.git(&config);
+            let git = install_opts.git(&config);
 
             // set up the repo
             if !no_git {
@@ -148,10 +151,15 @@ impl InitArgs {
             if !offline {
                 if root.join("lib/forge-std").exists() {
                     sh_warn!("\"lib/forge-std\" already exists, skipping install...")?;
-                    self.install.install(&mut config, vec![])?;
+                    install_opts.install(&mut config, vec![])?;
                 } else {
-                    let dep = "https://github.com/foundry-rs/forge-std".parse()?;
-                    self.install.install(&mut config, vec![dep])?;
+                    // Parse forge-std dependency with SSH preference if needed
+                    let dep = if ssh {
+                        Dependency::from_str_with_ssh_preference("https://github.com/foundry-rs/forge-std", false)?
+                    } else {
+                        "https://github.com/foundry-rs/forge-std".parse()?
+                    };
+                    install_opts.install(&mut config, vec![dep])?;
                 }
             }
 

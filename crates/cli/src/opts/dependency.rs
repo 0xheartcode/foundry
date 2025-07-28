@@ -2,6 +2,7 @@
 
 use eyre::Result;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::LazyLock};
 
 static GH_REPO_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\w-]+/[\w.-]+").unwrap());
@@ -37,7 +38,7 @@ const COMMON_ORG_ALIASES: &[(&str, &str); 2] =
 ///
 /// Non Github URLs must be provided with an https:// prefix.
 /// Adding dependencies as local paths is not supported yet.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dependency {
     /// The name of the dependency
     pub name: String,
@@ -47,6 +48,9 @@ pub struct Dependency {
     pub tag: Option<String>,
     /// Optional alias of the dependency
     pub alias: Option<String>,
+    /// Whether to use SSH URLs instead of HTTPS
+    #[serde(default)]
+    pub use_ssh: bool,
 }
 
 impl FromStr for Dependency {
@@ -137,7 +141,7 @@ impl FromStr for Dependency {
             (None, None, None)
         };
 
-        Ok(Self { name: name.or_else(|| alias.clone()).unwrap(), url, tag, alias })
+        Ok(Self { name: name.or_else(|| alias.clone()).unwrap(), url, tag, alias, use_ssh: false })
     }
 }
 
@@ -151,6 +155,79 @@ impl Dependency {
     pub fn require_url(&self) -> Result<&str> {
         self.url.as_deref().ok_or_else(|| eyre::eyre!("dependency {} has no url", self.name()))
     }
+
+    /// Parse dependency with SSH preference
+    pub fn from_str_with_ssh_preference(s: &str, use_ssh: bool) -> Result<Self> {
+        if use_ssh && s.contains("git@") {
+            // When SSH flag is set and the URL is already SSH, parse it without conversion
+            let mut dep = Self::parse_without_url_conversion(s)?;
+            dep.use_ssh = true;
+            Ok(dep)
+        } else {
+            // Normal parsing (converts SSH to HTTPS)
+            let mut dep = Self::from_str(s)?;
+            dep.use_ssh = use_ssh;
+            Ok(dep)
+        }
+    }
+
+    /// Parse dependency without converting SSH URLs to HTTPS
+    fn parse_without_url_conversion(dependency: &str) -> Result<Self> {
+        // Similar to from_str but preserves SSH URLs
+        let url_and_version: Vec<&str> = VERSION_PREFIX_REGEX.split(dependency).collect();
+        let dependency_str = url_and_version[0];
+        let mut tag_or_branch = url_and_version.get(1).map(|version| version.to_string());
+
+        let (mut alias, dependency) = if let Some(split) = dependency_str.split_once(ALIAS_SEPARATOR) {
+            (Some(String::from(split.0)), split.1.to_string())
+        } else {
+            (None, dependency_str.to_string())
+        };
+
+        let dependency = dependency.as_str();
+
+        // Extract the URL without converting SSH to HTTPS
+        let url_with_version = if GH_REPO_PREFIX_REGEX.is_match(dependency) {
+            Some(dependency.to_string())
+        } else if GH_REPO_REGEX.is_match(dependency) {
+            Some(format!("https://{GITHUB}/{dependency}"))
+        } else {
+            alias = Some(dependency.to_string());
+            None
+        };
+
+        let (url, name, tag) = if let Some(url_with_version) = url_with_version {
+            let mut split = url_with_version.rsplit(VERSION_SEPARATOR);
+            let mut url = url_with_version.as_str();
+
+            if tag_or_branch.is_none() {
+                let maybe_tag_or_branch = split.next().unwrap();
+                if let Some(actual_url) = split.next()
+                    && !maybe_tag_or_branch.contains('/')
+                {
+                    tag_or_branch = Some(maybe_tag_or_branch.to_string());
+                    url = actual_url;
+                }
+            }
+
+            let url = url.to_string();
+            // Extract name from the URL
+            let name = url
+                .split('/')
+                .last()
+                .or_else(|| url.split(':').last())
+                .ok_or_else(|| eyre::eyre!("no dependency name found"))?
+                .trim_end_matches(".git")
+                .to_string();
+
+            (Some(url), Some(name), tag_or_branch)
+        } else {
+            (None, None, None)
+        };
+
+        Ok(Self { name: name.or_else(|| alias.clone()).unwrap(), url, tag, alias, use_ssh: false })
+    }
+
 }
 
 #[cfg(test)]
@@ -250,6 +327,7 @@ mod tests {
             assert_eq!(dep.tag, expected_tag.map(ToString::to_string));
             assert_eq!(dep.name, "lootloose");
             assert_eq!(dep.alias, expected_alias.map(ToString::to_string));
+            assert!(!dep.use_ssh); // Default should be false
         });
     }
 
@@ -413,5 +491,35 @@ mod tests {
             dep.url,
             Some("https://ghp_mytoken@github.com/private-org/precompiles-solidity".to_string())
         );
+    }
+
+    #[test]
+    fn test_ssh_preference_parsing() {
+        // Test parsing with SSH preference enabled - preserves SSH URL
+        let dep = Dependency::from_str_with_ssh_preference(
+            "git@github.com:foundry-rs/foundry.git",
+            true
+        ).unwrap();
+        assert_eq!(dep.name, "foundry");
+        assert_eq!(dep.url, Some("git@github.com:foundry-rs/foundry.git".to_string()));
+        assert!(dep.use_ssh);
+
+        // Test parsing with SSH preference disabled - converts to HTTPS
+        let dep = Dependency::from_str_with_ssh_preference(
+            "git@github.com:foundry-rs/foundry.git",
+            false
+        ).unwrap();
+        assert_eq!(dep.name, "foundry");
+        assert_eq!(dep.url, Some("https://github.com/foundry-rs/foundry".to_string()));
+        assert!(!dep.use_ssh);
+
+        // Test parsing HTTPS URL with SSH preference - keeps HTTPS
+        let dep = Dependency::from_str_with_ssh_preference(
+            "https://github.com/foundry-rs/foundry",
+            true
+        ).unwrap();
+        assert_eq!(dep.name, "foundry");
+        assert_eq!(dep.url, Some("https://github.com/foundry-rs/foundry".to_string()));
+        assert!(dep.use_ssh);
     }
 }
